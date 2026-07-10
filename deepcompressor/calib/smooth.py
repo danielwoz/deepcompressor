@@ -1008,6 +1008,11 @@ def smooth_linear_modules(
         for module in prevs:
             if module is None:
                 continue
+            if getattr(module, "weight", None) is None:
+                raise ValueError(
+                    f"cannot fuse smoothing scale into {module.__class__.__name__} without an affine weight"
+                    " (e.g. LayerNorm with elementwise_affine=False); set `fuse_when_possible: false`"
+                )
             downscale = downscale.to(device=module.weight.device)
             smooth_downscale_param(module.weight, downscale, channels_dim=0)
             if hasattr(module, "bias") and module.bias is not None:

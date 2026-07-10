@@ -12,6 +12,8 @@ from diffusers.pipelines import (
     FluxControlPipeline,
     FluxFillPipeline,
     SanaPipeline,
+    WanImageToVideoPipeline,
+    WanPipeline,
 )
 from omniconfig import configclass
 from torch import nn
@@ -101,6 +103,10 @@ class DiffusionPipelineConfig:
             self.task = "depth-to-image"
         elif self.name == "flux.1-fill-dev":
             self.task = "inpainting"
+        elif self.name.startswith("wan2.1-t2v-"):
+            self.task = "text-to-video"
+        elif self.name.startswith("wan2.1-i2v-"):
+            self.task = "image-to-video"
 
     def build(
         self, *, dtype: str | torch.dtype | None = None, device: str | torch.device | None = None
@@ -344,12 +350,25 @@ class DiffusionPipelineConfig:
                 path = "black-forest-labs/FLUX.1-Fill-dev"
             elif name == "flux.1-schnell":
                 path = "black-forest-labs/FLUX.1-schnell"
+            elif name == "wan2.1-t2v-1.3b":
+                path = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+            elif name == "wan2.1-t2v-14b":
+                path = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+            elif name == "wan2.1-i2v-14b-480p":
+                path = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+            elif name == "wan2.1-i2v-14b-720p":
+                path = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
             else:
                 raise ValueError(f"Path for {name} is not specified.")
         if name in ["flux.1-canny-dev", "flux.1-depth-dev"]:
             pipeline = FluxControlPipeline.from_pretrained(path, torch_dtype=dtype)
         elif name == "flux.1-fill-dev":
             pipeline = FluxFillPipeline.from_pretrained(path, torch_dtype=dtype)
+        elif name.startswith("wan2.1-t2v-"):
+            # `AutoPipelineForText2Image` cannot resolve video pipelines
+            pipeline = WanPipeline.from_pretrained(path, torch_dtype=dtype)
+        elif name.startswith("wan2.1-i2v-"):
+            pipeline = WanImageToVideoPipeline.from_pretrained(path, torch_dtype=dtype)
         elif name.startswith("sana-"):
             if dtype == torch.bfloat16:
                 pipeline = SanaPipeline.from_pretrained(path, variant="bf16", torch_dtype=dtype, use_safetensors=True)
@@ -384,7 +403,7 @@ class DiffusionPipelineConfig:
                 The list of text encoder name, model, and tokenizer.
         """
         results: list[tuple[str, PreTrainedModel, PreTrainedTokenizer]] = []
-        for key in vars.__dict__.keys():
+        for key in vars(pipeline).keys():
             if key.startswith("text_encoder"):
                 suffix = key[len("text_encoder") :]
                 encoder, tokenizer = getattr(pipeline, f"text_encoder{suffix}"), getattr(pipeline, f"tokenizer{suffix}")

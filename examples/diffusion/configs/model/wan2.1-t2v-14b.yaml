@@ -1,0 +1,56 @@
+pipeline:
+  name: wan2.1-t2v-14b
+  dtype: torch.bfloat16
+eval:
+  num_steps: 50
+  guidance_scale: 5.0
+  height: 480
+  width: 832
+  num_frames: 81
+  frame_rate: 16
+  protocol: unipcflow{num_steps}-g{guidance_scale}
+quant:
+  calib:
+    batch_size: 1
+  wgts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 2
+      element_size: 512
+      sample_size: -1
+    low_rank:
+      sample_batch_size: 2
+      sample_size: -1
+    skips:
+    - embed
+    - transformer_proj_in
+    - transformer_proj_out
+    - transformer_norm
+    - transformer_add_norm
+  ipts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 2
+      element_size: 512
+      sample_size: -1
+    skips:
+    - embed
+    - transformer_proj_in
+    - transformer_proj_out
+    - transformer_norm
+    - transformer_add_norm
+  opts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 2
+      element_size: 512
+      sample_size: -1
+  smooth:
+    proj:
+      element_batch_size: -1
+      sample_batch_size: 2
+      element_size: -1
+      sample_size: -1
+    attn:
+      sample_batch_size: 2
+      sample_size: -1

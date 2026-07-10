@@ -15,6 +15,7 @@ from diffusers.models.transformers.transformer_flux import (
     FluxSingleTransformerBlock,
     FluxTransformerBlock,
 )
+from diffusers.models.transformers.transformer_wan import WanAttention, WanTransformerBlock
 from omniconfig import configclass
 
 from deepcompressor.data.cache import (
@@ -105,7 +106,7 @@ class DiffusionConcatCacheAction(ConcatCacheAction):
             cache (`TensorsCache`):
                 Cache.
         """
-        if isinstance(module, Attention):
+        if isinstance(module, (Attention, WanAttention)):
             encoder_hidden_states = tensors.get("encoder_hidden_states", None)
             if encoder_hidden_states is None:
                 tensors.pop("encoder_hidden_states", None)
@@ -172,7 +173,7 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
                 ),
                 outputs=TensorCache(channels_dim=-1, reshape=LinearReshapeFn()),
             )
-        elif isinstance(module, Attention):
+        elif isinstance(module, (Attention, WanAttention)):
             return IOTensorsCache(
                 inputs=TensorsCache(
                     OrderedDict(
@@ -230,6 +231,15 @@ class DiffusionCalibCacheLoader(BaseCalibCacheLoader):
                     encoder_hidden_states.detach().cpu() if save_all else MISSING,
                 ],
                 kwargs=kwargs,
+            )
+        elif isinstance(m, WanTransformerBlock):
+            # move the auxiliary positional inputs to kwargs so that replay and
+            # smoothing evaluation carry `encoder_hidden_states`, `temb`, and
+            # `rotary_emb` alongside the cached hidden states
+            for key, value in zip(("encoder_hidden_states", "temb", "rotary_emb"), args[1:]):
+                kwargs.setdefault(key, value)
+            return ModuleForwardInput(
+                args=[hidden_states.detach().cpu() if save_all else MISSING], kwargs=kwargs
             )
         else:
             return ModuleForwardInput(

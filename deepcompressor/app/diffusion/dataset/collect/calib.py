@@ -23,7 +23,7 @@ def process(x: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(x.float().numpy()).to(dtype)
 
 
-def collect(config: DiffusionPtqRunConfig, dataset: datasets.Dataset):
+def collect(config: DiffusionPtqRunConfig, dataset: datasets.Dataset, step_stride: int = 1):
     samples_dirpath = os.path.join(config.output.root, "samples")
     caches_dirpath = os.path.join(config.output.root, "caches")
     os.makedirs(samples_dirpath, exist_ok=True)
@@ -69,15 +69,26 @@ def collect(config: DiffusionPtqRunConfig, dataset: datasets.Dataset):
             else:
                 pipeline_kwargs["control_image"] = controls
 
-        result_images = pipeline(prompts, generator=generators, **pipeline_kwargs).images
+        result = pipeline(prompts, generator=generators, **pipeline_kwargs)
+        if task in ["text-to-video", "image-to-video"]:
+            from diffusers.utils import export_to_video
+
+            result_samples = result.frames
+        else:
+            result_samples = result.images
         num_guidances = (len(caches) // batch_size) // config.eval.num_steps
         num_steps = len(caches) // (batch_size * num_guidances)
         assert (
             len(caches) == batch_size * num_steps * num_guidances
         ), f"Unexpected number of caches: {len(caches)} != {batch_size} * {config.eval.num_steps} * {num_guidances}"
-        for j, (filename, image) in enumerate(zip(filenames, result_images, strict=True)):
-            image.save(os.path.join(samples_dirpath, f"{filename}.png"))
+        for j, (filename, sample) in enumerate(zip(filenames, result_samples, strict=True)):
+            if task in ["text-to-video", "image-to-video"]:
+                export_to_video(sample, os.path.join(samples_dirpath, f"{filename}.mp4"), fps=config.eval.frame_rate)
+            else:
+                sample.save(os.path.join(samples_dirpath, f"{filename}.png"))
             for s in range(num_steps):
+                if s % step_stride != 0:
+                    continue
                 for g in range(num_guidances):
                     c = caches[s * batch_size * num_guidances + g * batch_size + j]
                     c["filename"] = filename
@@ -102,12 +113,17 @@ class CollectConfig:
             Path to the prompt file.
         num_samples (`int`, *optional*, defaults to `128`):
             Number of samples to collect.
+        step_stride (`int`, *optional*, defaults to `1`):
+            Stride over denoising steps when saving caches. A stride of `n` keeps
+            every `n`-th step, shrinking the cache footprint for long-sequence
+            (e.g. video) models.
     """
 
     root: str = "datasets"
     dataset_name: str = "qdiff"
     data_path: str = "prompts/qdiff.yaml"
     num_samples: int = 128
+    step_stride: int = 1
 
 
 if __name__ == "__main__":
@@ -142,4 +158,4 @@ if __name__ == "__main__":
 
     ptq_config.output.root = collect_dirpath
     os.makedirs(ptq_config.output.root, exist_ok=True)
-    collect(ptq_config, dataset=dataset)
+    collect(ptq_config, dataset=dataset, step_stride=collect_config.step_stride)

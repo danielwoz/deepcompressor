@@ -77,6 +77,8 @@ class DiffusionEvalConfig:
     clean_caption: bool | None = None
     num_steps: int | None = None
     guidance_scale: float | None = None
+    num_frames: int | None = None
+    frame_rate: int = 16
     num_samples: int = 1024
 
     benchmarks: list[str] = field(
@@ -119,6 +121,8 @@ class DiffusionEvalConfig:
             kwargs["num_inference_steps"] = self.num_steps
         if self.guidance_scale is not None:
             kwargs["guidance_scale"] = self.guidance_scale
+        if self.num_frames is not None:
+            kwargs["num_frames"] = self.num_frames
         return kwargs
 
     def _generate(
@@ -160,7 +164,8 @@ class DiffusionEvalConfig:
             filenames = batch["filename"][rank :: self.num_gpus]
             if len(filenames) == 0:
                 continue
-            if all(os.path.exists(os.path.join(dirpath, f"{filename}.png")) for filename in filenames):
+            ext = ".mp4" if task in ["text-to-video", "image-to-video"] else ".png"
+            if all(os.path.exists(os.path.join(dirpath, f"{filename}{ext}")) for filename in filenames):
                 continue
             prompts = batch["prompt"][rank :: self.num_gpus]
             seeds = [hash_str_to_int(name) for name in filenames]
@@ -183,9 +188,15 @@ class DiffusionEvalConfig:
                     pipeline_kwargs["control_image"] = controls
 
             output = pipeline(prompts, generator=generators, **pipeline_kwargs)
-            images = output.images
-            for filename, image in zip(filenames, images, strict=True):
-                image.save(os.path.join(dirpath, f"{filename}.png"))
+            if task in ["text-to-video", "image-to-video"]:
+                from diffusers.utils import export_to_video
+
+                for filename, video in zip(filenames, output.frames, strict=True):
+                    export_to_video(video, os.path.join(dirpath, f"{filename}.mp4"), fps=self.frame_rate)
+            else:
+                images = output.images
+                for filename, image in zip(filenames, images, strict=True):
+                    image.save(os.path.join(dirpath, f"{filename}.png"))
 
     def generate(
         self,
@@ -235,6 +246,10 @@ class DiffusionEvalConfig:
         gen_root = gen_root or self.gen_root
         if not skip_gen:
             self.generate(pipeline, gen_root=gen_root, task=task)
+        if task in ["text-to-video", "image-to-video"]:
+            raise NotImplementedError(
+                "Video metrics are not implemented; use `--skip-eval` to generate videos without evaluation."
+            )
         if not self.chunk_only:
             return compute_image_metrics(
                 gen_root=gen_root,

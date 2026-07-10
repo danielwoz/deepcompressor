@@ -36,6 +36,12 @@ from diffusers.models.transformers.transformer_flux import (
     FluxTransformerBlock,
 )
 from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+from diffusers.models.transformers.transformer_wan import (
+    WanAttention,
+    WanTimeTextImageEmbedding,
+    WanTransformer3DModel,
+    WanTransformerBlock,
+)
 from diffusers.models.unets.unet_2d import UNet2DModel
 from diffusers.models.unets.unet_2d_blocks import (
     CrossAttnDownBlock2D,
@@ -56,6 +62,8 @@ from diffusers.pipelines import (
     StableDiffusion3Pipeline,
     StableDiffusionPipeline,
     StableDiffusionXLPipeline,
+    WanImageToVideoPipeline,
+    WanPipeline,
 )
 
 from deepcompressor.nn.patch.conv import ConcatConv2d, ShiftedConv2d
@@ -1946,13 +1954,197 @@ class FluxStruct(DiTStruct):
         return {k: v for k, v in key_map.items() if v}
 
 
+@dataclass(kw_only=True)
+class WanAttentionStruct(DiffusionAttentionStruct):
+    module: WanAttention = field(repr=False, kw_only=False)
+    """the module of WanAttention"""
+
+    def filter_kwargs(self, kwargs: dict) -> dict:
+        """Filter layer kwargs to attn kwargs."""
+        attn_kwargs = {}
+        if self.is_self_attn() and "rotary_emb" in kwargs:
+            attn_kwargs["rotary_emb"] = kwargs["rotary_emb"]
+        return attn_kwargs
+
+    @staticmethod
+    def _default_construct(
+        module: WanAttention,
+        /,
+        parent: tp.Optional["DiffusionTransformerBlockStruct"] = None,
+        fname: str = "",
+        rname: str = "",
+        rkey: str = "",
+        idx: int = 0,
+        **kwargs,
+    ) -> "WanAttentionStruct":
+        # `WanAttention` keeps its projections in `to_q`/`to_k`/`to_v` for both
+        # self- and cross-attention; cross-attention K/V consume the encoder
+        # stream, so they occupy the `add_*` (encoder) slots following the
+        # cross-attention convention of `DiffusionAttentionStruct`.
+        # I2V models attach extra image-stream `add_k_proj`/`add_v_proj` linears
+        # to the cross-attention; they see only ~257 CLIP tokens per video, so
+        # they stay unquantized and outside the struct.
+        if module.is_cross_attention:
+            q_proj, k_proj, v_proj = module.to_q, None, None
+            add_q_proj, add_k_proj, add_v_proj, add_o_proj = None, module.to_k, module.to_v, None
+            q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "", ""
+            add_q_proj_rname, add_k_proj_rname, add_v_proj_rname, add_o_proj_rname = "", "to_k", "to_v", ""
+            with_rope = False
+        else:
+            q_proj, k_proj, v_proj = module.to_q, module.to_k, module.to_v
+            add_q_proj, add_k_proj, add_v_proj, add_o_proj = None, None, None, None
+            q_proj_rname, k_proj_rname, v_proj_rname = "to_q", "to_k", "to_v"
+            add_q_proj_rname, add_k_proj_rname, add_v_proj_rname, add_o_proj_rname = "", "", "", ""
+            with_rope = True
+        o_proj, o_proj_rname = module.to_out[0], "to_out.0"
+        assert isinstance(o_proj, nn.Linear)
+        head_size = module.to_q.weight.shape[0] // module.heads
+        config = AttentionConfigStruct(
+            hidden_size=q_proj.weight.shape[1],
+            add_hidden_size=add_k_proj.weight.shape[1] if add_k_proj is not None else 0,
+            inner_size=q_proj.weight.shape[0],
+            num_query_heads=module.heads,
+            num_key_value_heads=module.to_k.weight.shape[0] // head_size,
+            with_qk_norm=module.norm_q is not None,
+            with_rope=with_rope,
+        )
+        return WanAttentionStruct(
+            module=module,
+            parent=parent,
+            fname=fname,
+            idx=idx,
+            rname=rname,
+            rkey=rkey,
+            config=config,
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+            o_proj=o_proj,
+            add_q_proj=add_q_proj,
+            add_k_proj=add_k_proj,
+            add_v_proj=add_v_proj,
+            add_o_proj=add_o_proj,
+            q=None,
+            k=None,
+            v=None,
+            q_proj_rname=q_proj_rname,
+            k_proj_rname=k_proj_rname,
+            v_proj_rname=v_proj_rname,
+            o_proj_rname=o_proj_rname,
+            add_q_proj_rname=add_q_proj_rname,
+            add_k_proj_rname=add_k_proj_rname,
+            add_v_proj_rname=add_v_proj_rname,
+            add_o_proj_rname=add_o_proj_rname,
+            q_rname="",
+            k_rname="",
+            v_rname="",
+        )
+
+
+def _construct_wan_transformer_block(
+    module: WanTransformerBlock,
+    /,
+    parent: tp.Optional["DiffusionTransformerStruct"] = None,
+    fname: str = "",
+    rname: str = "",
+    rkey: str = "",
+    idx: int = 0,
+    **kwargs,
+) -> DiffusionTransformerBlockStruct:
+    # `norm2` is the cross-attention pre-norm (affine iff `cross_attn_norm`);
+    # `norm1`/`norm3` have no affine weights. The adaLN modulation is the shared
+    # `condition_embedder.time_proj` output plus the per-block `scale_shift_table`
+    # parameter, matching the "ada_norm_single" convention.
+    return DiffusionTransformerBlockStruct(
+        module=module,
+        parent=parent,
+        fname=fname,
+        idx=idx,
+        rname=rname,
+        rkey=rkey,
+        parallel=False,
+        pre_attn_norms=[module.norm1, module.norm2],
+        pre_attn_add_norms=[None, None],
+        attns=[module.attn1, module.attn2],
+        pre_ffn_norm=module.norm3,
+        ffn=module.ffn,
+        pre_add_ffn_norm=None,
+        add_ffn=None,
+        pre_attn_norm_rnames=["norm1", "norm2"],
+        pre_attn_add_norm_rnames=["", ""],
+        attn_rnames=["attn1", "attn2"],
+        pre_ffn_norm_rname="norm3",
+        ffn_rname="ffn",
+        pre_add_ffn_norm_rname="",
+        add_ffn_rname="",
+        norm_type="ada_norm_single",
+        add_norm_type="ada_norm_single",
+    )
+
+
+@dataclass(kw_only=True)
+class WanStruct(DiTStruct):
+    module: WanTransformer3DModel = field(repr=False, kw_only=False)
+    """the module of WanTransformer3DModel"""
+    # region child modules
+    input_embed: nn.Conv3d
+    time_embed: WanTimeTextImageEmbedding
+    text_embed: None = field(init=False, repr=False, default=None)
+    # endregion
+    # region relative names
+    text_embed_rname: str = field(init=False, repr=False, default="")
+    # endregion
+
+    @staticmethod
+    def _default_construct(
+        module: tp.Union[WanPipeline, WanImageToVideoPipeline, WanTransformer3DModel],
+        /,
+        parent: tp.Optional[BaseModuleStruct] = None,
+        fname: str = "",
+        rname: str = "",
+        rkey: str = "",
+        idx: int = 0,
+        **kwargs,
+    ) -> "WanStruct":
+        if isinstance(module, (WanPipeline, WanImageToVideoPipeline)):
+            module = module.transformer
+        if isinstance(module, WanTransformer3DModel):
+            # `patch_embedding` is a Conv3d and thus outside the Linear/Conv2d
+            # quantization scope; `condition_embedder` covers the timestep
+            # embeds, the shared adaLN `time_proj`, and the text/image embeds,
+            # all categorized as `time_embed` (they share the skip tier).
+            return WanStruct(
+                module=module,
+                parent=parent,
+                fname=fname,
+                idx=idx,
+                rname=rname,
+                rkey=rkey,
+                input_embed=module.patch_embedding,
+                time_embed=module.condition_embedder,
+                transformer_blocks=module.blocks,
+                norm_out=module.norm_out,
+                proj_out=module.proj_out,
+                input_embed_rname="patch_embedding",
+                time_embed_rname="condition_embedder",
+                norm_out_rname="norm_out",
+                proj_out_rname="proj_out",
+                transformer_blocks_rname="blocks",
+            )
+        raise NotImplementedError(f"Unsupported module type: {type(module)}")
+
+
 DiffusionAttentionStruct.register_factory(Attention, DiffusionAttentionStruct._default_construct)
+
+DiffusionAttentionStruct.register_factory(WanAttention, WanAttentionStruct._default_construct)
 
 DiffusionFeedForwardStruct.register_factory(
     (FeedForward, FluxSingleTransformerBlock, GLUMBConv), DiffusionFeedForwardStruct._default_construct
 )
 
 DiffusionTransformerBlockStruct.register_factory(DIT_BLOCK_CLS, DiffusionTransformerBlockStruct._default_construct)
+
+DiffusionTransformerBlockStruct.register_factory(WanTransformerBlock, _construct_wan_transformer_block)
 
 UNetBlockStruct.register_factory(UNET_BLOCK_CLS, UNetBlockStruct._default_construct)
 
@@ -1964,6 +2156,14 @@ FluxStruct.register_factory(
 
 DiTStruct.register_factory(tp.Union[DIT_PIPELINE_CLS, DIT_CLS], DiTStruct._default_construct)
 
+DiTStruct.register_factory(
+    tp.Union[WanPipeline, WanImageToVideoPipeline, WanTransformer3DModel], WanStruct._default_construct
+)
+
 DiffusionTransformerStruct.register_factory(Transformer2DModel, DiffusionTransformerStruct._default_construct)
 
 DiffusionModelStruct.register_factory(tp.Union[PIPELINE_CLS, MODEL_CLS], DiffusionModelStruct._default_construct)
+
+DiffusionModelStruct.register_factory(
+    tp.Union[WanPipeline, WanImageToVideoPipeline, WanTransformer3DModel], WanStruct._default_construct
+)

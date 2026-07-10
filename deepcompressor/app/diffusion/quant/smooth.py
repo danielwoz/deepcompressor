@@ -62,6 +62,8 @@ def smooth_diffusion_qkv_proj(
             if not hasattr(attn.parent.module, "pos_embed") or attn.parent.module.pos_embed is None:
                 prevs = attn.parent.pre_attn_norms[attn.idx]
                 assert isinstance(prevs, nn.LayerNorm)
+                if prevs.weight is None:  # norm without affine weight cannot absorb the scale
+                    prevs = None
         cache_key = attn.q_proj_name
         config_wgts = config.wgts
         if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
@@ -81,7 +83,8 @@ def smooth_diffusion_qkv_proj(
         )
         if prevs is None:
             # we need to register forward pre hook to smooth inputs
-            if attn.module.group_norm is None and attn.module.spatial_norm is None:
+            # (`getattr` guards attention classes without these attributes, e.g. `WanAttention`)
+            if getattr(attn.module, "group_norm", None) is None and getattr(attn.module, "spatial_norm", None) is None:
                 ActivationSmoother(
                     smooth_cache[cache_key],
                     channels_dim=-1,
@@ -104,7 +107,8 @@ def smooth_diffusion_qkv_proj(
         prevs = None
         pre_attn_add_norm = attn.parent.pre_attn_add_norms[attn.idx]
         if isinstance(pre_attn_add_norm, nn.LayerNorm) and config.smooth.proj.fuse_when_possible:
-            prevs = pre_attn_add_norm
+            if pre_attn_add_norm.weight is not None:
+                prevs = pre_attn_add_norm
         cache_key = attn.add_k_proj_name
         config_wgts = config.wgts
         if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
@@ -250,7 +254,7 @@ def smooth_diffusion_up_proj(
         logger.debug("- %s.up_proj", ffn.name)
         prevs = None
         if config.smooth.proj.fuse_when_possible and isinstance(pre_ffn_norm, nn.LayerNorm):
-            if ffn.parent.norm_type in ["ada_norm", "layer_norm"]:
+            if ffn.parent.norm_type in ["ada_norm", "layer_norm"] and pre_ffn_norm.weight is not None:
                 prevs = pre_ffn_norm
         cache_key = ffn.up_proj_name
         channels_dim = -1 if isinstance(ffn.down_proj, nn.Linear) else 1
