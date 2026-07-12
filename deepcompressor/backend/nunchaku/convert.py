@@ -500,6 +500,11 @@ def check_wan_weight_round_trip(
         assert max_dist < 0.1, f"{candidate_name}: weight is {max_dist} away from the 4-bit grid"
 
 
+def is_wan_unit_skipped(block_name: str, unit: str, skips: list[str] | None) -> bool:
+    """A unit is skipped when listed globally (`attn2.to_kv`) or per block (`blocks.5.attn2.to_kv`)."""
+    return bool(skips) and (unit in skips or f"{block_name}.{unit}" in skips)
+
+
 def convert_to_nunchaku_wan_transformer_block_state_dict(
     state_dict: dict[str, torch.Tensor],
     scale_dict: dict[str, torch.Tensor],
@@ -507,8 +512,16 @@ def convert_to_nunchaku_wan_transformer_block_state_dict(
     branch_dict: dict[str, torch.Tensor],
     block_name: str,
     float_point: bool = False,
+    skips: list[str] | None = None,
+    orig_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], set[str]]:
-    """Convert one Wan transformer block; returns the converted dict and consumed source names."""
+    """Convert one Wan transformer block; returns the converted dict and consumed source names.
+
+    Units listed in `skips` stay unquantized: their ORIGINAL bf16 weights (from
+    `orig_state_dict` — the calibrated `model.pt` weights are smoothed,
+    branch-subtracted, and fake-quantized, so they must not be reused) pass
+    through under the diffusers member names.
+    """
     down_proj_local_name = "ffn.net.2.linear"
     if f"{block_name}.{down_proj_local_name}.weight" not in state_dict:
         down_proj_local_name = "ffn.net.2"
@@ -523,6 +536,30 @@ def convert_to_nunchaku_wan_transformer_block_state_dict(
         "ffn.net.0.proj": "ffn.net.0.proj",
         "ffn.net.2": down_proj_local_name,
     }
+    skipped_units = {unit for unit in local_name_map if is_wan_unit_skipped(block_name, unit, skips)}
+    skipped_converted: dict[str, torch.Tensor] = {}
+    skipped_consumed: set[str] = set()
+    for unit in skipped_units:
+        assert orig_state_dict is not None, "--model-path original weights are required for skipped units"
+        candidate_local_names = local_name_map.pop(unit)
+        if isinstance(candidate_local_names, str):
+            candidate_local_names = [candidate_local_names]
+        for candidate_local_name in candidate_local_names:
+            # restore under the unpatched diffusers name (strip any `.linear`)
+            orig_local_name = candidate_local_name[: -len(".linear")] if candidate_local_name.endswith(
+                ".linear"
+            ) else candidate_local_name
+            for suffix in ("weight", "bias"):
+                orig_key = f"{block_name}.{orig_local_name}.{suffix}"
+                skipped_converted[f"{orig_local_name}.{suffix}"] = orig_state_dict[orig_key].clone()
+            candidate_name = f"{block_name}.{candidate_local_name}"
+            skipped_consumed.update(
+                {f"{candidate_name}.weight", f"{candidate_name}.bias"}
+            )
+            if candidate_local_name.endswith(".linear"):
+                skipped_consumed.add(f"{block_name}.{orig_local_name}.shift")
+    if skipped_units:
+        print(f"  - Keeping {sorted(skipped_units)} of {block_name} unquantized (skip list)")
     # smooth scales and low-rank branches are anchored on the first member of
     # each fused group (the calibration cache key convention)
     smooth_name_map = {
@@ -534,6 +571,7 @@ def convert_to_nunchaku_wan_transformer_block_state_dict(
         "ffn.net.0.proj": "ffn.net.0.proj",
         "ffn.net.2": down_proj_local_name,
     }
+    smooth_name_map = {k: v for k, v in smooth_name_map.items() if k in local_name_map}
     branch_name_map = dict(smooth_name_map)
     convert_map = {name: "linear" for name in local_name_map}
 
@@ -565,7 +603,8 @@ def convert_to_nunchaku_wan_transformer_block_state_dict(
         convert_map=convert_map,
         float_point=float_point,
     )
-    consumed: set[str] = set()
+    update_state_dict(converted, skipped_converted)
+    consumed: set[str] = set(skipped_consumed)
     for candidate_name in candidate_names:
         consumed.add(f"{candidate_name}.weight")
         consumed.add(f"{candidate_name}.bias")
@@ -580,6 +619,8 @@ def convert_to_nunchaku_wan_state_dict(
     smooth_dict: dict[str, torch.Tensor],
     branch_dict: dict[str, torch.Tensor],
     float_point: bool = False,
+    skips: list[str] | None = None,
+    orig_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convert a Wan 2.1 quantization checkpoint to a single nunchaku state dict.
 
@@ -608,6 +649,8 @@ def convert_to_nunchaku_wan_state_dict(
             branch_dict=branch_dict,
             block_name=block_name,
             float_point=float_point,
+            skips=skips,
+            orig_state_dict=orig_state_dict,
         )
         update_state_dict(converted, block_converted, prefix=block_name)
         consumed.update(block_consumed)
@@ -632,7 +675,10 @@ def convert_to_nunchaku_wan_state_dict(
 
 
 def build_wan_metadata(
-    converted_state_dict: dict[str, torch.Tensor], model_config: dict, float_point: bool
+    converted_state_dict: dict[str, torch.Tensor],
+    model_config: dict,
+    float_point: bool,
+    skips: list[str] | None = None,
 ) -> dict[str, str]:
     """Build the single-file safetensors metadata consumed by `NunchakuModelLoaderMixin`."""
     rank = 32
@@ -654,6 +700,8 @@ def build_wan_metadata(
         },
         "rank": rank,
     }
+    if skips:
+        quantization_config["skips"] = sorted(skips)
     return {
         "config": json.dumps(model_config),
         "model_class": "NunchakuWanTransformer3DModel",
@@ -676,6 +724,14 @@ if __name__ == "__main__":
         help="diffusers model directory or HuggingFace repo (required for Wan to embed the transformer config).",
     )
     parser.add_argument("--float-point", action="store_true", help="use float-point 4-bit quantization (Flux only).")
+    parser.add_argument(
+        "--skips",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Wan units to keep unquantized, globally (attn2.to_kv) or per block (blocks.5.attn2.to_kv).",
+    )
+    parser.add_argument("--output-name", type=str, default=None, help="override the output checkpoint filename stem.")
     args = parser.parse_args()
     if not args.output_root:
         args.output_root = args.quant_path
@@ -707,17 +763,31 @@ if __name__ == "__main__":
         else:
             model_config = WanTransformer3DModel.load_config(args.model_path, subfolder="transformer")
         model_config = dict(model_config)
+        orig_state_dict = None
+        if args.skips:
+            # skipped units restore their ORIGINAL weights (model.pt holds
+            # smoothed, branch-subtracted, fake-quantized ones)
+            orig_transformer = WanTransformer3DModel.from_pretrained(
+                args.model_path,
+                subfolder=None if os.path.exists(os.path.join(args.model_path, "config.json")) else "transformer",
+                torch_dtype=torch.bfloat16,
+            )
+            orig_state_dict = orig_transformer.state_dict()
+            del orig_transformer
         converted_state_dict = convert_to_nunchaku_wan_state_dict(
             state_dict=state_dict,
             scale_dict=scale_dict,
             smooth_dict=smooth_dict,
             branch_dict=branch_dict,
             float_point=float_point,
+            skips=args.skips,
+            orig_state_dict=orig_state_dict,
         )
-        metadata = build_wan_metadata(converted_state_dict, model_config, float_point)
+        metadata = build_wan_metadata(converted_state_dict, model_config, float_point, skips=args.skips)
         os.makedirs(args.output_root, exist_ok=True)
         precision_name = "fp4" if float_point else "int4"
-        output_path = os.path.join(args.output_root, f"{model_name}-svdq-{precision_name}.safetensors")
+        output_stem = args.output_name or f"{model_name}-svdq-{precision_name}"
+        output_path = os.path.join(args.output_root, f"{output_stem}.safetensors")
         safetensors.torch.save_file(converted_state_dict, output_path, metadata=metadata)
         print(f"Quantized model saved to {output_path}.")
     else:

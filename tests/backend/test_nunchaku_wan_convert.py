@@ -198,3 +198,34 @@ def test_wan_convert_rejects_mismatched_precision():
             branch_dict=branch_dict,
             float_point=True,
         )
+
+
+def test_wan_convert_with_skips():
+    model = make_wan_model().to(torch.bfloat16)
+    orig_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+    state_dict, scale_dict, smooth_dict, branch_dict = make_fake_quant_checkpoint(model, float_point=False)
+    converted = convert_to_nunchaku_wan_state_dict(
+        state_dict=state_dict,
+        scale_dict=scale_dict,
+        smooth_dict=smooth_dict,
+        branch_dict=branch_dict,
+        float_point=False,
+        skips=["attn1.to_out.0", "blocks.1.attn2.to_kv"],
+        orig_state_dict=orig_state_dict,
+    )
+    for block_idx in range(2):
+        prefix = f"blocks.{block_idx}"
+        # globally skipped unit: original bf16 weights, no packed tensors
+        assert f"{prefix}.attn1.to_out.0.qweight" not in converted
+        assert torch.equal(converted[f"{prefix}.attn1.to_out.0.weight"], orig_state_dict[f"{prefix}.attn1.to_out.0.weight"])
+        # non-skipped units unchanged
+        assert f"{prefix}.attn1.to_qkv.qweight" in converted
+    # per-block skip applies only to block 1
+    assert "blocks.0.attn2.to_kv.qweight" in converted
+    assert "blocks.1.attn2.to_kv.qweight" not in converted
+    assert torch.equal(converted["blocks.1.attn2.to_k.weight"], orig_state_dict["blocks.1.attn2.to_k.weight"])
+    assert torch.equal(converted["blocks.1.attn2.to_v.weight"], orig_state_dict["blocks.1.attn2.to_v.weight"])
+    metadata = build_wan_metadata(converted, {"num_layers": 2}, False, skips=["attn1.to_out.0", "blocks.1.attn2.to_kv"])
+    import json
+
+    assert json.loads(metadata["quantization_config"])["skips"] == ["attn1.to_out.0", "blocks.1.attn2.to_kv"]
