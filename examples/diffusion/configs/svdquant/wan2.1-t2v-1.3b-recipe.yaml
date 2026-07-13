@@ -1,0 +1,37 @@
+# Banked Wan2.1-T2V-1.3B INT4 recipe (compose AFTER int4.yaml and gptq.yaml).
+#
+# Full pipeline (from examples/diffusion):
+#
+# 1. Calibration collection (16 prompts x 50-step trajectories, every 5th step):
+#    python -m deepcompressor.app.diffusion.dataset.collect.calib \
+#        configs/model/wan2.1-t2v-1.3b.yaml configs/collect/qdiff.yaml \
+#        --collect-num-samples 16 --collect-step-stride 5 --eval-num-frames 33
+#
+# 2. PTQ (SmoothQuant 20-grid + rank-128 low-rank + GPTQ):
+#    python -m deepcompressor.app.diffusion.ptq \
+#        configs/model/wan2.1-t2v-1.3b.yaml configs/svdquant/int4.yaml \
+#        configs/svdquant/gptq.yaml configs/svdquant/wan2.1-t2v-1.3b-recipe.yaml \
+#        --eval-num-frames 33 \
+#        --calib-path 'datasets/{dtype}/{model}/{protocol}/{data}/s16' \
+#        --skip-eval true --skip-gen true --save-model true
+#
+# 3. Conversion (sensitivity-guided per-block skips stay bf16; from the
+#    per-layer NMSE sweep of 2026-07-11 — re-run the sweep if the recipe changes):
+#    python -m deepcompressor.backend.nunchaku.convert \
+#        --quant-path <run dir>/model --model-name wan2.1-t2v-1.3b \
+#        --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers --output-root <out> \
+#        --skips blocks.{5..24}.attn1.to_out.0 blocks.{12..24}.ffn.net.2 \
+#                blocks.{10..21}.attn2.to_q
+#    (expand the brace ranges in your shell; see tools/round2_chain.sh in the
+#    project repo for the expanded form)
+#
+# Result: photoreal 480P output, 1.20x end-to-end vs bf16 on an RTX 3090,
+# 1.4 GB transformer checkpoint. Same-seed PSNR-vs-bf16 saturates ~16 dB for
+# 1.3B W4A4 (bf16 different-seed floor is ~9 dB) — evaluate with LPIPS and
+# visual review, not PSNR gates.
+quant:
+  calib:
+    num_samples: 16
+  wgts:
+    low_rank:
+      rank: 128
