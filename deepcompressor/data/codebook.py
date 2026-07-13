@@ -47,6 +47,17 @@ class Codebook:
         """
         dtype = tensor.dtype
         tensor = tensor.to(self.values.dtype).contiguous()
+        # process large tensors in chunks: the CUDA op allocates working
+        # memory proportional to the input, which can exceed the free VRAM
+        # for full-layer activation tensors during fake-quant calibration
+        chunk_numel = 1 << 26
+        if tensor.numel() > chunk_numel:
+            out = torch.empty_like(tensor)
+            flat_in, flat_out = tensor.view(-1), out.view(-1)
+            for start in range(0, tensor.numel(), chunk_numel):
+                chunk = flat_in[start : start + chunk_numel].contiguous()
+                flat_out[start : start + chunk_numel] = _C.round_to_nearest_in_codebook_cuda(chunk, self.values)
+            return out.to(dtype=dtype)
         return _C.round_to_nearest_in_codebook_cuda(tensor, self.values).to(dtype=dtype)
 
     def to(self, *, device: torch.device | None = None, dtype: torch.dtype | None = None) -> "Codebook":
